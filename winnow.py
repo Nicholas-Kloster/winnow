@@ -15,7 +15,8 @@ Output : every candidate tagged PASS, REFUTED, or DOWNGRADE, with the Insight
 
   PASS      not a known false alarm. NOT verified - still needs a protocol
             check before it earns a finding label.
-  REFUTED   a false positive. The exposure does not exist.
+  REFUTED   not a real finding for this host: the exposure does not exist,
+            or it exists but does not belong to this host.
   DOWNGRADE a real observation carrying a severity it did not earn.
 
 winnow removes known noise. It does not verify. That is the next stage.
@@ -130,6 +131,7 @@ def looks_like_html(s):
 
 
 _META_WORD = re.compile(r"\bmetadata\b", re.I)
+_FIREBASE_HOST = re.compile(r"https?://([a-zA-Z0-9._-]+)\.firebaseio\.com", re.I)
 
 
 # --- the Insight registry ---------------------------------------------------
@@ -154,6 +156,18 @@ def _sig_metadata_endpoint_html(c):
     # returns structured data, never an HTML page.
     return bool(_META_WORD.search(c.get("title", "") or c.get("check", ""))
                 and looks_like_html(c["evidence"]))
+
+
+def _sig_firebase_name_from_label(c):
+    # A Firebase finding whose project name is a bare generic word — earth,
+    # marine, data — was guessed from one of the host's own DNS labels. A
+    # bare word in the global firebaseio.com namespace belongs to an
+    # unrelated project. The database is real and public, but it is not this
+    # host's. The finding is a misattribution.
+    if c["check"] != "firebase_public":
+        return False
+    m = _FIREBASE_HOST.search(c.get("url", ""))
+    return bool(m and m.group(1).isalpha())
 
 
 def _sig_port_open_inflated(c):
@@ -183,6 +197,17 @@ SIGNATURES = [
         "reason": "the finding claims a cloud metadata endpoint, but the "
                   "evidence is an HTML page; metadata endpoints return "
                   "structured data, never an HTML document",
+    },
+    {
+        "id": "firebase-name-from-hostname-label",
+        "verdict": "REFUTED",
+        "insight": "Firebase project name guessed from a hostname label",
+        "match": _sig_firebase_name_from_label,
+        "reason": "the Firebase project name is a bare generic word taken "
+                  "from one of the host's own DNS labels; a bare word in the "
+                  "global firebaseio.com namespace belongs to an unrelated "
+                  "project, so the public database is real but is not this "
+                  "host's — a misattribution",
     },
     {
         "id": "port-open-inflated",
