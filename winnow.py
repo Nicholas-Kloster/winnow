@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""
+winnow - separate real findings from false-positive chaff.
+
+A scanner produces candidates. Some of them match patterns already known to be
+false alarms: a port number reported as an exposure, a status code read as an
+identity, an HTML page mistaken for a JSON API. Each lesson gets written down
+as a NuClide Insight. winnow carries those Insights as code and screens
+scanner output against them.
+
+Input  : a scanner's output - menlohunt JSON, an aimap report, or a directory
+         tree of them.
+Output : every candidate tagged PASS, REFUTED, or DOWNGRADE, with the Insight
+         that flagged it and a one-line reason.
+
+  PASS      not a known false alarm. NOT verified - still needs a protocol
+            check before it earns a finding label.
+  REFUTED   a false positive. The exposure does not exist.
+  DOWNGRADE a real observation carrying a severity it did not earn.
+
+winnow removes known noise. It does not verify. That is the next stage.
+
+Part of the NuClide toolchain.   github.com/Nicholas-Kloster/winnow
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+
+__version__ = "0.1.0"
+
+SEVERITIES = ("info", "low", "medium", "high", "critical")
+
+
+def _norm_sev(s):
+    s = (s or "").strip().lower()
+    return s if s in SEVERITIES else "medium"
+
+
+# --- candidate model --------------------------------------------------------
+# A candidate is a normalized dict so signatures need not care which scanner
+# produced it: scanner, host, port, check, severity, title, url, evidence.
+
+def load_menlohunt(path):
+    """menlohunt JSON -> candidates."""
+    out = []
+    try:
+        d = json.load(open(path))
+    except Exception:
+        return out
+    for f in d.get("findings", []):
+        out.append({
+            "scanner": "menlohunt",
+            "host": f.get("host", d.get("target", "")),
+            "port": f.get("port"),
+            "check": f.get("check", ""),
+            "severity": _norm_sev(f.get("severity")),
+            "title": f.get("title", ""),
+            "url": f.get("url", ""),
+            "evidence": f.get("evidence", "") or "",
+            "source_file": path,
+        })
+    return out
+
+
+def load_aimap(path):
+    """aimap report JSON (v1.9+ flat schema) -> candidates."""
+    out = []
+    try:
+        d = json.load(open(path))
+    except Exception:
+        return out
+    for e in d.get("enum_results", []):
+        details = e.get("details")
+        ev = "\n".join(details) if isinstance(details, list) else str(details or "")
+        out.append({
+            "scanner": "aimap",
+            "host": e.get("host", ""),
+            "port": e.get("port"),
+            "check": (e.get("service", "") or "").lower(),
+            "severity": _norm_sev(e.get("risk_level")),
+            "title": e.get("service", ""),
+            "url": e.get("base_url", ""),
+            "evidence": ev,
+            "source_file": path,
+        })
+    return out
+
+
+def load_file(path):
+    """Dispatch one JSON file to the right adapter by its shape."""
+    try:
+        d = json.load(open(path))
+    except Exception:
+        return []
+    if not isinstance(d, dict):
+        return []
+    if "findings" in d and "summary" in d:
+        return load_menlohunt(path)
+    if "enum_results" in d or "ports_scanned" in d:
+        return load_aimap(path)
+    return []
+
+
+def gather(target):
+    """Accept a single file or a directory tree of scanner JSON."""
+    if os.path.isdir(target):
+        cands = []
+        for path in sorted(glob.glob(os.path.join(target, "**", "*.json"),
+                                     recursive=True)):
+            cands += load_file(path)
+        return cands
+    if os.path.isfile(target):
+        return load_file(target)
+    sys.exit("winnow: no such file or directory: %s" % target)
+
+
+# --- shared detectors -------------------------------------------------------
+
+def looks_like_html(s):
+    """True when a response body is an HTML document, not structured output."""
+    if not s:
+        return False
+    head = s.lstrip()[:600].lower()
+    return (head.startswith(("<!doctype", "<html"))
+            or "<html" in head or "<head>" in head or "<body" in head)
+
+
+_META_WORD = re.compile(r"\bmetadata\b", re.I)
+
+
+# --- the Insight registry ---------------------------------------------------
+# Each signature is one codified NuClide Insight: a pattern already proven to
+# be noise. A signature carries a verdict - REFUTED for a false positive,
+# DOWNGRADE for a real observation that did not earn its severity. Adding the
+# next Insight is one entry in this list.
+
+def _sig_gcp_metadata_html(c):
+    # The GCP metadata API lives at the link-local address 169.254.169.254,
+    # is gated by the Metadata-Flavor: Google header, and returns plaintext
+    # or JSON. It is not reachable by an external scan and never serves an
+    # HTML document. menlohunt's gcp_metadata check fired on the target's own
+    # web server returning an ordinary HTML page.
+    return (c["scanner"] == "menlohunt"
+            and c["check"] == "gcp_metadata"
+            and looks_like_html(c["evidence"]))
+
+
+def _sig_metadata_endpoint_html(c):
+    # The generalized form: any cloud metadata endpoint (AWS, Azure, GCP)
+    # returns structured data, never an HTML page.
+    return bool(_META_WORD.search(c.get("title", "") or c.get("check", ""))
+                and looks_like_html(c["evidence"]))
+
+
+def _sig_port_open_inflated(c):
+    # An open port carries no severity on its own. Severity is earned by a
+    # protocol-level probe of the service, not by the port number.
+    return (c["scanner"] == "menlohunt"
+            and c["check"] == "port_open"
+            and c["severity"] in ("low", "medium", "high", "critical"))
+
+
+SIGNATURES = [
+    {
+        "id": "gcp-metadata-html",
+        "verdict": "REFUTED",
+        "insight": "GCP metadata API false positive",
+        "match": _sig_gcp_metadata_html,
+        "reason": "evidence is an HTML document; the GCP metadata API is "
+                  "link-local (169.254.169.254), gated by the Metadata-Flavor "
+                  "header, returns plaintext or JSON, and is unreachable by an "
+                  "external scan - it never produces an HTML body",
+    },
+    {
+        "id": "metadata-endpoint-html",
+        "verdict": "REFUTED",
+        "insight": "cloud metadata endpoint claimed, HTML returned",
+        "match": _sig_metadata_endpoint_html,
+        "reason": "the finding claims a cloud metadata endpoint, but the "
+                  "evidence is an HTML page; metadata endpoints return "
+                  "structured data, never an HTML document",
+    },
+    {
+        "id": "port-open-inflated",
+        "verdict": "DOWNGRADE",
+        "insight": "a port number names a candidate, not a finding",
+        "match": _sig_port_open_inflated,
+        "reason": "an open port is a real observation but carries no severity "
+                  "on its own; severity is earned by a protocol-level probe, "
+                  "so the candidate belongs at info until one is run",
+    },
+]
+
+
+def screen(candidates):
+    """Tag each candidate. First matching signature wins."""
+    results = []
+    for c in candidates:
+        verdict, sig = "PASS", None
+        for s in SIGNATURES:
+            try:
+                hit = s["match"](c)
+            except Exception:
+                hit = False
+            if hit:
+                verdict, sig = s["verdict"], s
+                break
+        results.append({"candidate": c, "verdict": verdict, "signature": sig})
+    return results
+
+
+# --- output -----------------------------------------------------------------
+
+def _crit(group):
+    return sum(1 for r in group
+               if r["candidate"]["severity"] in ("critical", "high"))
+
+
+def render(results):
+    total = len(results)
+    refuted = [r for r in results if r["verdict"] == "REFUTED"]
+    downgraded = [r for r in results if r["verdict"] == "DOWNGRADE"]
+    passed = [r for r in results if r["verdict"] == "PASS"]
+
+    L = ["=" * 70,
+         "  winnow %s   %d candidates screened" % (__version__, total),
+         "=" * 70]
+
+    by_sig = {}
+    for r in refuted + downgraded:
+        by_sig.setdefault(r["signature"]["id"], []).append(r)
+    if by_sig:
+        L.append("")
+        L.append("FLAGGED  (matched a codified Insight)")
+        for sid, group in sorted(by_sig.items(), key=lambda kv: -len(kv[1])):
+            sig = group[0]["signature"]
+            L.append("")
+            L.append("  [%s]  %s  -  %d candidates  (%d critical/high)"
+                     % (sid, sig["verdict"], len(group), _crit(group)))
+            L.append("    insight: %s" % sig["insight"])
+            L.append("    reason : %s" % sig["reason"])
+            for r in group[:4]:
+                c = r["candidate"]
+                L.append("      - %s:%s  %-8s %s"
+                         % (c["host"], c["port"] if c["port"] else "-",
+                            c["severity"], (c["title"] or c["check"])[:46]))
+            if len(group) > 4:
+                L.append("      ... and %d more" % (len(group) - 4))
+
+    L.append("")
+    L.append("-" * 70)
+    L.append("  screened        : %d" % total)
+    L.append("  false positives : %d   (%d critical/high - the exposure does "
+             "not exist)" % (len(refuted), _crit(refuted)))
+    L.append("  over-rated      : %d   (%d critical/high - real, but no "
+             "severity earned)" % (len(downgraded), _crit(downgraded)))
+    L.append("  passed          : %d   - not verified, still need protocol "
+             "checks" % len(passed))
+    L.append("-" * 70)
+    return "\n".join(L)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="winnow",
+        description="Screen scanner findings against codified NuClide Insights.")
+    ap.add_argument("target", help="scanner JSON file, or a directory of them")
+    ap.add_argument("--json", action="store_true", help="emit JSON")
+    ap.add_argument("--flagged", action="store_true",
+                    help="with --json, emit only flagged (non-PASS) candidates")
+    ap.add_argument("--passed", action="store_true",
+                    help="with --json, emit only the passing candidates")
+    ap.add_argument("--out", metavar="FILE", help="write the report to FILE")
+    ap.add_argument("--version", action="version", version="winnow " + __version__)
+    args = ap.parse_args()
+
+    results = screen(gather(args.target))
+
+    if args.json:
+        rows = results
+        if args.flagged:
+            rows = [r for r in results if r["verdict"] != "PASS"]
+        elif args.passed:
+            rows = [r for r in results if r["verdict"] == "PASS"]
+        payload = [{
+            "verdict": r["verdict"],
+            "insight": r["signature"]["id"] if r["signature"] else None,
+            "reason": r["signature"]["reason"] if r["signature"] else None,
+            **{k: v for k, v in r["candidate"].items() if k != "evidence"},
+        } for r in rows]
+        text = json.dumps(payload, indent=2)
+    else:
+        text = render(results)
+
+    if args.out:
+        open(args.out, "w").write(text + "\n")
+        sys.stderr.write("winnow: wrote %s\n" % args.out)
+    else:
+        print(text)
+
+
+if __name__ == "__main__":
+    main()
