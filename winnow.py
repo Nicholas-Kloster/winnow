@@ -132,6 +132,8 @@ def looks_like_html(s):
 
 _META_WORD = re.compile(r"\bmetadata\b", re.I)
 _FIREBASE_HOST = re.compile(r"https?://([a-zA-Z0-9._-]+)\.firebaseio\.com", re.I)
+_GCS_HOST = re.compile(r"storage\.googleapis\.com/([a-zA-Z0-9._-]+)", re.I)
+_GCS_SUFFIX = re.compile(r"-(?:backup|dev|prod|data)$", re.I)
 
 
 # --- the Insight registry ---------------------------------------------------
@@ -168,6 +170,19 @@ def _sig_firebase_name_from_label(c):
         return False
     m = _FIREBASE_HOST.search(c.get("url", ""))
     return bool(m and m.group(1).isalpha())
+
+
+def _sig_gcs_name_from_label(c):
+    # menlohunt's checkGCS guessed the bucket name from a host DNS label and
+    # expanded it with -dev/-prod/-data/-backup. A bare generic word, with or
+    # without one of those suffixes, collides with an unrelated bucket in the
+    # global GCS namespace and is not the host's.
+    if c["check"] not in ("gcs_public", "gcs_exists"):
+        return False
+    m = _GCS_HOST.search(c.get("url", ""))
+    if not m:
+        return False
+    return _GCS_SUFFIX.sub("", m.group(1)).isalpha()
 
 
 def _sig_port_open_inflated(c):
@@ -208,6 +223,17 @@ SIGNATURES = [
                   "global firebaseio.com namespace belongs to an unrelated "
                   "project, so the public database is real but is not this "
                   "host's — a misattribution",
+    },
+    {
+        "id": "gcs-name-from-hostname-label",
+        "verdict": "REFUTED",
+        "insight": "GCS bucket name guessed from a hostname label",
+        "match": _sig_gcs_name_from_label,
+        "reason": "the GCS bucket name is a bare generic word taken from one "
+                  "of the host's DNS labels, optionally with a -dev/-prod/"
+                  "-data/-backup suffix; a bare word in the global GCS "
+                  "namespace belongs to an unrelated bucket, so the public "
+                  "bucket is real but is not this host's — a misattribution",
     },
     {
         "id": "port-open-inflated",
