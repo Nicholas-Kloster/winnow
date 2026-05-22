@@ -193,6 +193,38 @@ def _sig_port_open_inflated(c):
             and c["severity"] in ("low", "medium", "high", "critical"))
 
 
+def _sig_metabase_setup_token_null(c):
+    # /api/session/properties returning 200 does not mean the setup token is
+    # live. If the response includes setup-token: null or setup-token: "" the
+    # Metabase instance has already completed setup and the admin-claim surface
+    # is closed. Scanners that anchor on the 200 status alone fire on every
+    # deployed Metabase instance.
+    ev = c.get("evidence", "") or ""
+    return (
+        "metabase" in (c.get("title", "") or c.get("check", "") or "").lower()
+        and "setup" in (c.get("title", "") or c.get("check", "") or "").lower()
+        and ("setup-token" in ev.lower() or "setup_token" in ev.lower())
+        and ('"null"' in ev or ": null" in ev or '""' in ev
+             or "null" in ev.lower())
+    )
+
+
+def _sig_vllm_completions_405(c):
+    # vLLM is present and unauthenticated but /v1/completions returned 405
+    # Method Not Allowed. The endpoint exists but completions are blocked at
+    # the serving layer. The real enumeration surface is /v1/models; arbitrary
+    # completion is not confirmed.
+    ev = c.get("evidence", "") or ""
+    service_field = (
+        (c.get("title", "") or "")
+        + " "
+        + (c.get("check", "") or "")
+        + " "
+        + (c.get("url", "") or "")
+    )
+    return ("vllm" in service_field.lower() and "405" in ev)
+
+
 SIGNATURES = [
     {
         "id": "gcp-metadata-html",
@@ -243,6 +275,30 @@ SIGNATURES = [
         "reason": "an open port is a real observation but carries no severity "
                   "on its own; severity is earned by a protocol-level probe, "
                   "so the candidate belongs at info until one is run",
+    },
+    {
+        "id": "metabase-setup-token-null",
+        "verdict": "REFUTED",
+        "insight": "Metabase /api/session/properties returned 200 but "
+                   "setup-token is null or empty — setup is complete",
+        "match": _sig_metabase_setup_token_null,
+        "reason": "the scanner found /api/session/properties returned 200 but "
+                  "the setup-token field is null or empty; this means Metabase "
+                  "setup has been completed and the admin-claim surface is "
+                  "closed — not a finding",
+    },
+    {
+        "id": "vllm-completions-405",
+        "verdict": "DOWNGRADE",
+        "insight": "vLLM /v1/completions returns HTTP 405 — OpenAI-compat API "
+                   "present but completion endpoint blocked",
+        "match": _sig_vllm_completions_405,
+        "reason": "vLLM is present and unauthenticated but /v1/completions "
+                  "returns 405 Method Not Allowed — the model is serving but "
+                  "completions are blocked; the real risk is /v1/models (model "
+                  "enumeration) and /v1/embeddings if enabled, not arbitrary "
+                  "completion; downgrade from high to medium pending protocol "
+                  "check",
     },
 ]
 
