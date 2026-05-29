@@ -18,7 +18,7 @@ every candidate against them.
 ## Install
 
 ```
-git clone https://github.com/Nicholas-Kloster/winnow
+git clone https://github.com/nuclide-research/winnow
 ```
 
 Python 3.8+. No dependencies. winnow is pure standard library.

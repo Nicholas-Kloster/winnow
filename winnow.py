@@ -21,7 +21,7 @@ Output : every candidate tagged PASS, REFUTED, or DOWNGRADE, with the Insight
 
 winnow removes known noise. It does not verify. That is the next stage.
 
-Part of the NuClide toolchain.   github.com/Nicholas-Kloster/winnow
+Part of the NuClide toolchain.   github.com/nuclide-research/winnow
 """
 
 import argparse
